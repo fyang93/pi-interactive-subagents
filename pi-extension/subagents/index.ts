@@ -215,13 +215,12 @@ function getToolExtensionPath(tool: string): string | undefined {
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
   }
-  const extBase = join(getAgentConfigDir(), "extensions");
+  const webAccessPath = join(getAgentConfigDir(), "npm", "node_modules", "pi-web-access");
   const map: Record<string, string> = {
-    web_search: join(extBase, "web-search", "index.ts"),
-    web_fetch: join(extBase, "web-fetch", "index.ts"),
-    video_extract: join(extBase, "video-extract", "index.ts"),
-    youtube_search: join(extBase, "youtube-search", "index.ts"),
-    google_image_search: join(extBase, "google-image-search", "index.ts"),
+    web_search: webAccessPath,
+    fetch_content: webAccessPath,
+    get_search_content: webAccessPath,
+    source_check: webAccessPath,
     safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
   };
   // Prefer the built-in path, but fall back to a runtime-registered extension
