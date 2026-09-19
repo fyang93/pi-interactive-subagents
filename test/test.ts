@@ -1,5 +1,6 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -1206,12 +1207,47 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  it("keeps delegation denied without subagent_agents even when extensions load normally", () => {
+    const moduleUrl = new URL("../pi-extension/subagents/index.ts", import.meta.url).href;
+    for (const allowed of [undefined, "", "scout"]) {
+      const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_AGENT: "worker" };
+      delete env.PI_SUBAGENT_ALLOWED;
+      if (allowed !== undefined) env.PI_SUBAGENT_ALLOWED = allowed;
+      const output = execFileSync(process.execPath, ["--input-type=module", "-e",
+        `import { __test__ } from ${JSON.stringify(moduleUrl)};
+         console.log(JSON.stringify(__test__.discoverAgentDefinitions().map(a => a.name)));`,
+      ], { env, encoding: "utf8" });
+      assert.deepEqual(JSON.parse(output), allowed ? ["scout"] : []);
+    }
+  });
+
+  it("treats empty tools frontmatter as unrestricted without swallowing the next field", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "empty-tools", "tools:   \nsubagent_agents: scout\nmodel: test/model");
+      const agent = testApi.loadAgentDefaults("empty-tools")!;
+      assert.equal(agent.tools, "");
+      assert.equal(agent.model, "test/model");
+      assert.deepEqual(agent.subagentAgents, ["scout"]);
+      assert.equal(testApi.buildSubagentToolAllowlist(agent.tools, { grantSpawning: true }), null);
+    });
+  });
+
+  it("preserves tool allowlists without disabling discovery or mapping extension paths", async () => {
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      const scout = testApi.loadAgentDefaults("scout");
+      const allowlist = testApi.buildSubagentToolAllowlist(scout?.tools)!;
+      assert.ok(allowlist.split(",").includes("mcp"));
+      assert.ok(!allowlist.split(",").includes("mcpScript"));
+      for (const tools of [allowlist, "mcp,mcpScript", "read,unknown_extension_tool"]) {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(parts, {
+          agent: "scout", toolAllowlist: tools, model: null, thinking: null,
+          systemPromptMode: null, identity: null, spawnable: null,
+          autoExit: true, cwd: null, agentDir: globalDir,
+        }, { artifactDir: globalDir, name: "scout" });
+        assert.deepEqual(parts, ["--tools", shellEscape(tools)]);
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1281,9 +1317,11 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+    assert.equal(testApi.buildSubagentToolAllowlist(" , ", { grantSpawning: true }), null);
+    assert.equal(testApi.buildSubagentToolAllowlist(undefined, { grantSpawning: true }), null);
   });
 
-  it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
+  it("applySandboxToParts replays model, identity, tool restriction, and bundled helpers", () => {
     withTempDir((d) => {
       const parts: string[] = [];
       testApi.applySandboxToParts(
@@ -1308,8 +1346,9 @@ describe("subagent discovery", () => {
       assert.ok(joined.includes("openrouter/z-ai/glm-5.2:medium"), "expected model:thinking");
       // Identity written to a file and appended.
       assert.ok(joined.includes("--append-system-prompt"), "expected --append-system-prompt");
-      // Default-deny restriction.
-      assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
+      assert.ok(!parts.includes("--no-extensions"), "extension discovery stays enabled");
+      assert.ok(parts.some((part) => part.endsWith("tools/safe-bash.ts'")));
+      assert.ok(parts.some((part) => part.endsWith("subagents/index.ts'")));
       const toolsIdx = parts.indexOf("--tools");
       assert.ok(toolsIdx >= 0, "expected --tools");
       // The value is shell-escaped (single-quoted) before joining.
@@ -1339,7 +1378,11 @@ describe("subagent discovery", () => {
         },
         { artifactDir: d, name: "fork" },
       );
-      assert.deepEqual(parts, []);
+      assert.ok(!parts.includes("--tools"));
+      assert.ok(!parts.includes("--no-extensions"));
+      assert.equal(parts[0], "-e");
+      assert.ok(parts[1].endsWith("tools/safe-bash.ts'"));
+      assert.equal(parts.length, 2);
     });
   });
 

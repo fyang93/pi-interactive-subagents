@@ -64,7 +64,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
-**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
+**Resume replays the saved loadout.** The optional tool allowlist, model, thinking level, system prompt, spawn whitelist, cwd, and config directory are snapshotted to `<session>.loadout.json`. Resume restores those settings; extensions are discovered from the current configuration, not frozen at spawn time.
 
 ### ask_question
 
@@ -76,7 +76,7 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openai-codex/gpt-5.6-luna` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **scout** | `openai-codex/gpt-5.6-luna` | `read`, `grep`, `find`, `ls`, `mcp` | Fast read-only codebase recon |
 | **researcher** | `openai-codex/gpt-5.6-luna` | `web_search`, `source_check`, `fetch_content`, `get_search_content`, `safe_bash` | Web research, synthesized into a sourced brief |
 | **worker** | pi default | `read`, `write`, `edit`, `bash`, `web_search`, `source_check`, `fetch_content`, `get_search_content` + spawning | General implementer; may spawn `scout` and `researcher` |
 
@@ -108,7 +108,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `source_check`, `fetch_content`, `get_search_content` (via `pi-web-access`), `safe_bash`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Optional comma-separated tool allowlist, passed as `--tools`. Omit or leave empty for the default full toolset. Extensions load normally in both cases; no tool-to-extension path mapping is needed. `ask_question` is added automatically, as are spawning tools when `subagent_agents` grants delegation |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -140,13 +140,21 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Tool restrictions are **optional**:
+
+- With `tools`: pass `--tools <allowlist>` (including child control tools).
+- Without `tools` (or with an empty value): omit `--tools` and use Pi's default full toolset, even when `subagent_agents` is configured.
+- In both cases, extensions are discovered normally from the child's configuration; no `--no-extensions` or third-party tool-path mapping is used. Package-local helpers (`ask_question`, `safe_bash`, and delegation support) are still explicitly loaded as needed.
+
+The saved tool allowlist survives resume. It limits model-callable tools, not extension initialization, event hooks, or background tasks; this is not a security sandbox. Only enable extensions that are suitable for running in child processes.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
-Web tools are loaded together through `-e ~/.pi/agent/npm/node_modules/pi-web-access`, instead of separate web-search/web-fetch extension files. This is the package location used by `pi install`; `--tools` still limits which tools are callable. Older sessions with a saved `web_fetch` allowlist should be replaced by new sessions using `fetch_content`.
+Install and enable tool-providing packages normally, for example `pi install npm:pi-web-access` or `pi install npm:pi-mcp-adapter`. Their tools can then be named in `tools`, without registering extension paths. Older sessions with a saved `web_fetch` allowlist should be replaced by new sessions using `fetch_content`.
 
-Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global.
+Scout allows `mcp` for discovery and single calls; add `mcpScript` if batching is needed. Without the adapter, scout falls back to local file tools. Configure CodeGraph or other servers through the adapter in the child's config/cwd; connections are not inherited from the parent. `mcp:server-name` frontmatter syntax is not supported by this extension. The gateway can access all configured servers: scout's read-only instructions are not an enforced MCP permission boundary. Restrict server operations separately when required.
+
+The old `registerToolExtension(name, path)` hook has been removed; enable the extension in Pi settings instead.
 
 ## Role folders
 
