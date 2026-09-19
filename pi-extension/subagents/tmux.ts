@@ -203,13 +203,13 @@ export function sendLongCommand(
 }
 
 /**
- * Read the screen contents of a pane (sync).
+ * Read the screen contents of a pane (sync), joining soft-wrapped lines.
  */
 export function readScreen(surface: string, lines = 50): string {
   requireTmux();
   return execFileSync(
     "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
+    ["capture-pane", "-p", "-J", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     {
       encoding: "utf8",
     },
@@ -217,13 +217,13 @@ export function readScreen(surface: string, lines = 50): string {
 }
 
 /**
- * Read the screen contents of a pane (async).
+ * Read the screen contents of a pane (async), joining soft-wrapped lines.
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   requireTmux();
   const { stdout } = await execFileAsync(
     "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
+    ["capture-pane", "-p", "-J", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     { encoding: "utf8" },
   );
   return stdout;
