@@ -1,6 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -30,7 +31,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { shellEscape } from "../pi-extension/subagents/zellij.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +57,7 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/zellij.ts";
 
 // --- Helpers ---
 
@@ -1206,13 +1207,47 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  it("keeps delegation denied without subagent_agents even when extensions load normally", () => {
+    const moduleUrl = new URL("../pi-extension/subagents/index.ts", import.meta.url).href;
+    for (const allowed of [undefined, "", "scout"]) {
+      const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_AGENT: "worker" };
+      delete env.PI_SUBAGENT_ALLOWED;
+      if (allowed !== undefined) env.PI_SUBAGENT_ALLOWED = allowed;
+      const output = execFileSync(process.execPath, ["--input-type=module", "-e",
+        `import { __test__ } from ${JSON.stringify(moduleUrl)};
+         console.log(JSON.stringify(__test__.discoverAgentDefinitions().map(a => a.name)));`,
+      ], { env, encoding: "utf8" });
+      assert.deepEqual(JSON.parse(output), allowed ? ["scout"] : []);
+    }
+  });
+
+  it("treats empty tools frontmatter as unrestricted without swallowing the next field", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "empty-tools", "tools:   \nsubagent_agents: scout\nmodel: test/model");
+      const agent = testApi.loadAgentDefaults("empty-tools")!;
+      assert.equal(agent.tools, "");
+      assert.equal(agent.model, "test/model");
+      assert.deepEqual(agent.subagentAgents, ["scout"]);
+      assert.equal(testApi.buildSubagentToolAllowlist(agent.tools, { grantSpawning: true }), null);
+    });
+  });
+
+  it("preserves tool allowlists without disabling discovery or mapping extension paths", async () => {
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      const scout = testApi.loadAgentDefaults("scout");
+      const allowlist = testApi.buildSubagentToolAllowlist(scout?.tools)!;
+      assert.ok(allowlist.split(",").includes("mcp"));
+      assert.ok(!allowlist.split(",").includes("mcpScript"));
+      for (const tools of [allowlist, "mcp,mcpScript", "read,unknown_extension_tool"]) {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(parts, {
+          agent: "scout", toolAllowlist: tools, model: null, thinking: null,
+          systemPromptMode: null, identity: null, spawnable: null,
+          autoExit: true, cwd: null, agentDir: globalDir,
+        }, { artifactDir: globalDir, name: "scout" });
+        assert.deepEqual(parts, ["--tools", shellEscape(tools)]);
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1282,9 +1317,11 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+    assert.equal(testApi.buildSubagentToolAllowlist(" , ", { grantSpawning: true }), null);
+    assert.equal(testApi.buildSubagentToolAllowlist(undefined, { grantSpawning: true }), null);
   });
 
-  it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
+  it("applySandboxToParts replays model, identity, tool restriction, and bundled helpers", () => {
     withTempDir((d) => {
       const parts: string[] = [];
       testApi.applySandboxToParts(
@@ -1309,8 +1346,9 @@ describe("subagent discovery", () => {
       assert.ok(joined.includes("openrouter/z-ai/glm-5.2:medium"), "expected model:thinking");
       // Identity written to a file and appended.
       assert.ok(joined.includes("--append-system-prompt"), "expected --append-system-prompt");
-      // Default-deny restriction.
-      assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
+      assert.ok(!parts.includes("--no-extensions"), "extension discovery stays enabled");
+      assert.ok(parts.some((part) => part.endsWith("tools/safe-bash.ts'")));
+      assert.ok(parts.some((part) => part.endsWith("subagents/index.ts'")));
       const toolsIdx = parts.indexOf("--tools");
       assert.ok(toolsIdx >= 0, "expected --tools");
       // The value is shell-escaped (single-quoted) before joining.
@@ -1340,7 +1378,11 @@ describe("subagent discovery", () => {
         },
         { artifactDir: d, name: "fork" },
       );
-      assert.deepEqual(parts, []);
+      assert.ok(!parts.includes("--tools"));
+      assert.ok(!parts.includes("--no-extensions"));
+      assert.equal(parts[0], "-e");
+      assert.ok(parts[1].endsWith("tools/safe-bash.ts'"));
+      assert.equal(parts.length, 2);
     });
   });
 
@@ -1741,7 +1783,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
+describe("zellij.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
@@ -1919,6 +1961,140 @@ describe("tool registration", () => {
     );
     assert.equal(props.sessionId, undefined, "sessionId should be removed");
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
+  });
+
+  it("guards concurrent resumes but permits retry after failed preparation, send, or provider completion", async () => {
+    const root = createTestDir();
+    const oldEnv = { ...process.env };
+    const testApi = (subagentsModule as any).__test__;
+    const deps = testApi.launchDeps;
+    const oldCreate = deps.createSurface;
+    const oldSend = deps.sendLongCommand;
+    const oldWatch = deps.watchSubagent;
+    try {
+      for (const key of Object.keys(process.env)) if (key.startsWith("PI_SUBAGENT_")) delete process.env[key];
+      const fakeBin = join(root, "bin");
+      mkdirSync(fakeBin);
+      const zellij = join(fakeBin, "zellij");
+      writeFileSync(zellij, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_ZELLIJ_LOG\"\nif [ \"$1\" = --version ]; then echo 'zellij 0.44.3'; fi\n");
+      chmodSync(zellij, 0o700);
+      const cliLog = join(root, "cli.log");
+      Object.assign(process.env, { PATH: `${fakeBin}:${oldEnv.PATH}`, ZELLIJ: "0", ZELLIJ_PANE_ID: "0", PI_SUBAGENT_SHELL_READY_DELAY_MS: "0", FAKE_ZELLIJ_LOG: cliLog });
+
+      const parentDir = join(root, "parent");
+      const artifactDir = join(parentDir, "artifacts", "parent-id");
+      const name = "worker\n# injected command";
+      const sessionFile = join(root, "child\nsession.jsonl");
+      writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "child-id", version: 3 }) + "\n");
+      registerName(artifactDir, name, { sessionFile, sessionId: "child-id" });
+      writeSubagentLoadout(sessionFile, {
+        agent: "worker", toolAllowlist: null, model: null, thinking: null,
+        systemPromptMode: null, identity: null, spawnable: null, autoExit: true,
+        cwd: null, agentDir: null,
+      });
+      const { api, registeredTools } = createMockExtensionApi();
+      let shutdown!: (...args: any[]) => void;
+      api.on = (event: string, handler: any) => { if (event === "session_shutdown") shutdown = handler; };
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((item) => item.name === "subagent_message");
+      const ctx = { sessionManager: {
+        getSessionFile: () => join(parentDir, "parent.jsonl"),
+        getSessionDir: () => parentDir,
+        getSessionId: () => "parent-id",
+      } };
+      const execute = () => tool.execute("call", { name, message: "continue" }, undefined, undefined, ctx);
+      let releaseCreate!: (surface: string) => void;
+      let creates = 0;
+      deps.createSurface = () => { creates++; return new Promise<string>((resolve) => { releaseCreate = resolve; }); };
+      let preamble = "";
+      deps.sendLongCommand = (_surface: string, _command: string, options: any) => { preamble = options.scriptPreamble; };
+      deps.watchSubagent = async () => ({ name: "worker", task: "continue", summary: "ok", exitCode: 0, elapsed: 0 });
+
+      const first = execute();
+      const second = await execute();
+      assert.equal(creates, 1);
+      assert.match(second.details.error, /already running or being resumed/);
+      releaseCreate("terminal_77");
+      assert.equal((await first).details.status, "started");
+      assert.ok(preamble.includes(`Subagent resume script for ${JSON.stringify(name)}`));
+      assert.ok(preamble.includes(`# Session: ${JSON.stringify(sessionFile)}`));
+      assert.equal(preamble.split("\n").some((line: string) => line === "# injected command"), false);
+
+      testApi.runningSubagents.clear();
+      assert.equal(testApi.resumingSessions.has(sessionFile), false);
+      let attempts = 0;
+      deps.createSurface = async () => {
+        if (++attempts === 1) throw new Error("pane preparation failed");
+        return "terminal_78";
+      };
+      await assert.rejects(execute(), /pane preparation failed/);
+      assert.equal(testApi.resumingSessions.has(sessionFile), false);
+      assert.equal((await execute()).details.status, "started", "a pre-send failure must permit retry");
+      testApi.runningSubagents.clear();
+      assert.equal(testApi.resumingSessions.has(sessionFile), false);
+
+      let sends = 0;
+      deps.createSurface = async () => { creates++; return "terminal_79"; };
+      deps.sendLongCommand = () => { sends++; throw new Error("uncertain send"); };
+      await assert.rejects(execute(), /uncertain send/);
+      assert.equal(testApi.resumingSessions.has(sessionFile), false);
+      deps.sendLongCommand = () => { sends++; };
+      assert.equal((await execute()).details.status, "started", "a failed send releases only the in-flight guard for an explicit retry");
+      assert.equal(sends, 2);
+      testApi.runningSubagents.clear();
+
+      // A real filesystem error inside sendLongCommand, before any CLI send.
+      deps.sendLongCommand = oldSend;
+      const scriptDir = join(artifactDir, "subagent-scripts");
+      writeFileSync(scriptDir, "not a directory");
+      await assert.rejects(execute(), /EEXIST|ENOTDIR/);
+      assert.equal(existsSync(cliLog), false, "script preparation must fail before invoking Zellij");
+      assert.equal(testApi.resumingSessions.has(sessionFile), false);
+      rmSync(scriptDir);
+      mkdirSync(scriptDir);
+      assert.equal((await execute()).details.status, "started", "repairing the filesystem must permit retry");
+      assert.match(readFileSync(cliLog, "utf8"), /^action write-chars /m);
+
+      // The real poller consumes a sidecar, rather than a stubbed poll result.
+      const active = [...testApi.runningSubagents.values()][0];
+      writeFileSync(sessionFile + ".exit", JSON.stringify({ type: "error", errorMessage: "provider unavailable" }));
+      const failed = await testApi.watchSubagent(active, new AbortController().signal, { close: () => {} });
+      assert.equal(failed.exitCode, 1);
+      assert.equal(testApi.runningSubagents.size, 0);
+      assert.equal(existsSync(sessionFile + ".exit"), false);
+      assert.equal((await execute()).details.status, "started", "provider error completion must permit resume");
+
+      testApi.runningSubagents.clear();
+      const moduleKey = Symbol.for("pi-subagents/poll-abort-controller");
+      const originalController = (globalThis as any)[moduleKey];
+      (globalThis as any)[moduleKey] = new AbortController();
+      try {
+        const commandsBefore = readFileSync(cliLog, "utf8");
+        deps.createSurface = () => new Promise<string>((resolve) => { releaseCreate = resolve; });
+        const pending = execute();
+        shutdown({}, {});
+        releaseCreate("terminal_80");
+        await assert.rejects(pending, /aborted/i);
+        assert.equal(readFileSync(cliLog, "utf8"), commandsBefore, "shutdown during creation must prevent sending a late launch command");
+        assert.equal(testApi.resumingSessions.size, 0);
+      } finally {
+        (globalThis as any)[moduleKey] = originalController;
+      }
+    } finally {
+      deps.createSurface = oldCreate;
+      deps.sendLongCommand = oldSend;
+      deps.watchSubagent = oldWatch;
+      testApi.runningSubagents.clear();
+      testApi.reservedNames.clear();
+      testApi.resumingSessions.clear();
+      for (const key of ["pi-subagents/widget-interval", "pi-subagents/status-interval"]) {
+        const symbol = Symbol.for(key);
+        clearInterval((globalThis as any)[symbol]);
+        (globalThis as any)[symbol] = null;
+      }
+      process.env = oldEnv;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("no longer registers subagent_interrupt or subagent_resume", () => {
@@ -2652,7 +2828,96 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("tmux.ts", () => {
+describe("watchSubagent", () => {
+  const testApi = (subagentsModule as any).__test__;
+  const running = { id: "watch-test", name: "watch-test", task: "task", surface: "surface-123", startTime: Date.now(), sessionFile: "/missing-session", statusState: {} } as any;
+
+  it("keeps a completed result when closing its surface fails", async () => {
+    const result = await testApi.watchSubagent(running, new AbortController().signal, {
+      poll: async () => ({ reason: "sentinel", exitCode: 0 }),
+      close: () => { throw new Error("close failed"); },
+    });
+    assert.equal(result.exitCode, 0);
+    assert.match(result.summary, /without output/);
+  });
+
+  it("closes and untracks tasks on caller abort, module abort and observation failure", async () => {
+    const closed: string[] = [];
+    const close = (surface: string) => { closed.push(surface); };
+    const poll = (_surface: string, signal: AbortSignal, options: any) => new Promise((_resolve, reject) => {
+      options.onTick();
+      signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      if (signal.aborted) reject(new Error("aborted"));
+    });
+
+    const userAbort = new AbortController();
+    userAbort.abort();
+    const userResult = await testApi.watchSubagent(running, userAbort.signal, { poll, close, observe: () => {} });
+    assert.equal(userResult.error, "cancelled");
+    assert.deepEqual(closed, ["surface-123"]);
+
+    const moduleKey = Symbol.for("pi-subagents/poll-abort-controller");
+    const original = (globalThis as any)[moduleKey];
+    const moduleAbort = new AbortController();
+    (globalThis as any)[moduleKey] = moduleAbort;
+    moduleAbort.abort();
+    const shutdownAbort = new AbortController();
+    shutdownAbort.abort();
+    try {
+      const moduleResult = await testApi.watchSubagent(running, shutdownAbort.signal, { poll, close, observe: () => {} });
+      assert.equal(moduleResult.error, "cancelled");
+    } finally {
+      (globalThis as any)[moduleKey] = original;
+    }
+    assert.deepEqual(closed, ["surface-123", "surface-123"]);
+
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.set(running.id, running);
+    const unknown = await testApi.watchSubagent(running, new AbortController().signal, {
+      poll: async (_surface: string, _signal: AbortSignal, options: any) => { options.onTick(); return { reason: "sentinel", exitCode: 0 }; },
+      observe: () => { throw new Error("observation failed"); },
+      close,
+    });
+    assert.equal(unknown.error, "observation failed");
+    assert.equal(runningMap.has(running.id), false);
+    assert.deepEqual(closed, ["surface-123", "surface-123", "surface-123"]);
+  });
+});
+
+describe("session shutdown", () => {
+  it("closes the watched pane and leaves no tracked child after the actual shutdown handler", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const moduleKey = Symbol.for("pi-subagents/poll-abort-controller");
+    const original = (globalThis as any)[moduleKey];
+    (globalThis as any)[moduleKey] = new AbortController();
+    const { api } = createMockExtensionApi();
+    let shutdown!: (...args: any[]) => void;
+    api.on = (event: string, handler: any) => { if (event === "session_shutdown") shutdown = handler; };
+    (subagentsModule as any).default(api);
+    const running = { id: "shutdown-test", name: "shutdown-test", task: "task", surface: "terminal_123", startTime: Date.now(), sessionFile: "/missing-session", abortController: new AbortController() };
+    const closed: string[] = [];
+    try {
+      testApi.runningSubagents.set(running.id, running);
+      const watching = testApi.watchSubagent(running, running.abortController.signal, {
+        poll: (_surface: string, signal: AbortSignal) => new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        }),
+        close: (surface: string) => closed.push(surface),
+      });
+      const childCount = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")];
+      assert.equal(childCount(), 1);
+      shutdown({}, {});
+      assert.equal((await watching).error, "cancelled");
+      assert.deepEqual(closed, [running.surface]);
+      assert.equal(childCount(), 0);
+    } finally {
+      testApi.runningSubagents.clear();
+      (globalThis as any)[moduleKey] = original;
+    }
+  });
+});
+
+describe("zellij.ts", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");

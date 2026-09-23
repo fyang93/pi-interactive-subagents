@@ -1,7 +1,7 @@
 {
   "name": "pi-interactive-subagents",
   "version": "3.7.2",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in tmux",
+  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in Zellij",
   "keywords": [
     "pi-package"
   ],
@@ -9,11 +9,11 @@
   "author": "Amos Blomqvist",
   "repository": {
     "type": "git",
-    "url": "https://github.com/amosblomqvist/pi-interactive-subagents"
+    "url": "https://github.com/fyang93/pi-interactive-subagents"
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts",
+    "test": "node --test test/test.ts test/zellij.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {

@@ -1,12 +1,12 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Zellij panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+Requires **Zellij 0.44+**. See [Acknowledgements](#acknowledgements) for the upstream project.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own pane without stealing keyboard focus: a new pane in the parent's Zellij tab. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,13 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+Pane placement follows your existing Zellij layout, including horizontal and vertical splits. The extension does not replace layouts or force equal-width columns. Keep `auto_layout true` in your Zellij configuration to let Zellij automatically rearrange panes on creation and removal. Pane operations are implemented in `pi-extension/subagents/zellij.ts`.
+
+Zellij creation uses `--near-current-pane` without `--direction`: placement follows the layout and keyboard focus is preserved, even when another tab is active. All reads, messages and closes target explicit pane IDs. Older Zellij releases are rejected because they lack the required pane-targeted CLI actions.
+
+On parent shutdown or `/reload`, the extension attempts to close its tracked subagent panes. Uncertain pane creation or command delivery is not automatically retried; inspect the reported pane or creation marker before retrying.
+
+Launches record the child process ID before execution. If the process exits or its pane is closed without a completion marker, the watcher confirms this on the next poll, removes the task from the running list, and reports an interruption. A surviving shell is left open. Idle processes, interrupted generation (Esc), and failed CLI queries are not treated as process exits.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -29,7 +35,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent in a dedicated Zellij pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -64,7 +70,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
-**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
+**Resume replays the saved loadout.** The optional tool allowlist, model, thinking level, system prompt, spawn whitelist, cwd, and config directory are snapshotted to `<session>.loadout.json`. Resume restores those settings; extensions are discovered from the current configuration, not frozen at spawn time.
 
 ### ask_question
 
@@ -76,9 +82,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | `openai-codex/gpt-5.6-luna` | `read`, `grep`, `find`, `ls`, `mcp` | Fast read-only codebase recon |
+| **researcher** | `openai-codex/gpt-5.6-luna` | `web_search`, `source_check`, `fetch_content`, `get_search_content`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | pi default | `read`, `write`, `edit`, `bash`, `web_search`, `source_check`, `fetch_content`, `get_search_content` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
@@ -108,7 +114,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Optional comma-separated tool allowlist, passed as `--tools`. Omit or leave empty for the default full toolset. Extensions load normally in both cases; no tool-to-extension path mapping is needed. `ask_question` is added automatically, as are spawning tools when `subagent_agents` grants delegation |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -140,11 +146,21 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Tool restrictions are **optional**:
+
+- With `tools`: pass `--tools <allowlist>` (including child control tools).
+- Without `tools` (or with an empty value): omit `--tools` and use Pi's default full toolset, even when `subagent_agents` is configured.
+- In both cases, extensions are discovered normally from the child's configuration; no `--no-extensions` or third-party tool-path mapping is used. Package-local helpers (`ask_question`, `safe_bash`, and delegation support) are still explicitly loaded as needed.
+
+The saved tool allowlist survives resume. It limits model-callable tools, not extension initialization, event hooks, or background tasks; this is not a security sandbox. Only enable extensions that are suitable for running in child processes.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
-Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global.
+Install and enable tool-providing packages normally, for example `pi install npm:pi-web-access` or `pi install npm:pi-mcp-adapter`. Their tools can then be named in `tools`, without registering extension paths. Older sessions with a saved `web_fetch` allowlist should be replaced by new sessions using `fetch_content`.
+
+Scout allows `mcp` for discovery and single calls; add `mcpScript` if batching is needed. Without the adapter, scout falls back to local file tools. Configure CodeGraph or other servers through the adapter in the child's config/cwd; connections are not inherited from the parent. `mcp:server-name` frontmatter syntax is not supported by this extension. The gateway can access all configured servers: scout's read-only instructions are not an enforced MCP permission boundary. Restrict server operations separately when required.
+
+The old `registerToolExtension(name, path)` hook has been removed; enable the extension in Pi settings instead.
 
 ## Role folders
 
@@ -178,15 +194,17 @@ Status display is configured via `config.json` in the extension directory (copy 
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- [Zellij](https://zellij.dev/) **0.44+**
 
 ```bash
-tmux new -A -s pi 'pi'
+zellij
+# Inside Zellij:
+pi
 ```
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+This fork builds on [Amos Blomqvist's tmux-only fork](https://github.com/amosblomqvist/pi-interactive-subagents) of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). The original project introduced the subagent architecture, multi-multiplexer surface layer, and status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
 
 ## License
 

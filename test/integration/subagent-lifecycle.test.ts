@@ -2,14 +2,14 @@
  * Integration tests for the full subagent lifecycle.
  *
  * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
- * Each test creates a tmux pane, runs pi with a task that uses the subagent
+ * Each test creates a Zellij pane, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
  * Costs: ~$0.01-0.05 per test run (haiku).
  * Duration: ~30-90s per test.
  *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ * Run inside Zellij:
+ *   npm run test:integration
  *
  * Configuration:
  *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
@@ -19,7 +19,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import {
-  getAvailableBackends,
+  isZellijAvailable,
   createTestEnv,
   cleanupTestEnv,
   createTrackedSurface,
@@ -34,15 +34,13 @@ import {
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends();
-
-if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+if (!isZellijAvailable()) {
+  console.log("⚠️  Zellij is not available — skipping subagent lifecycle integration tests");
+  console.log("   Run inside Zellij to enable these tests.");
 }
 
-for (const backend of backends) {
-  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
+if (isZellijAvailable()) {
+  describe("subagent-lifecycle [zellij]", { timeout: PI_TIMEOUT * 3 }, () => {
     let env: TestEnv;
 
     before(() => {
@@ -60,7 +58,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `echo-${id}`);
+      const surface = await createTrackedSurface(env, `echo-${id}`);
       await sleep(1000);
 
       const task = [
@@ -112,7 +110,7 @@ for (const backend of backends) {
       trackTempFile(env, startFile);
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `status-${id}`);
+      const surface = await createTrackedSurface(env, `status-${id}`);
       await sleep(1000);
 
       const task = [
@@ -157,7 +155,7 @@ for (const backend of backends) {
       trackTempFile(env, fileA);
       trackTempFile(env, fileB);
 
-      const surface = createTrackedSurface(env, `parallel-${id}`);
+      const surface = await createTrackedSurface(env, `parallel-${id}`);
       await sleep(1000);
 
       const task = [
@@ -195,7 +193,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-fork-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `fork-${id}`);
+      const surface = await createTrackedSurface(env, `fork-${id}`);
       await sleep(1000);
 
       const task = [
@@ -243,7 +241,7 @@ for (const backend of backends) {
     it("subagent caller_ping sends notification back to the parent", async () => {
       const id = uniqueId();
 
-      const surface = createTrackedSurface(env, `ping-${id}`);
+      const surface = await createTrackedSurface(env, `ping-${id}`);
       await sleep(1000);
 
       const task = [
@@ -277,7 +275,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `discovery-${id}`);
+      const surface = await createTrackedSurface(env, `discovery-${id}`);
       await sleep(1000);
 
       // Use subagents_list to verify test agents are discoverable,
@@ -305,7 +303,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `sysprompt-${id}`);
+      const surface = await createTrackedSurface(env, `sysprompt-${id}`);
       await sleep(1000);
 
       const task = [

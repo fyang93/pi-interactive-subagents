@@ -81,15 +81,13 @@ export function seedSubagentSessionFile(params: {
 }
 
 /**
- * A snapshot of everything needed to reconstruct a subagent's sandbox when its
- * session is later resumed via `subagent_message({ sessionId })`.
+ * A snapshot of the subagent loadout used by `subagent_message({ name })`.
  *
  * Written next to the session file as `<sessionFile>.loadout.json` at spawn
  * time. Resume replays this exact snapshot so the reincarnated process gets the
- * same `--no-extensions` + `--tools` restriction, model, identity, spawn
- * whitelist, cwd, and config dir it originally ran with — instead of falling
- * back to pi's default (all global extensions + full toolset). Storing the
- * resolved loadout (rather than re-deriving from the agent `.md` by name) keeps
+ * same optional `--tools` restriction, model, identity, spawn whitelist, cwd,
+ * and config dir. Extensions are discovered from the current configuration.
+ * Storing the resolved loadout (rather than re-deriving from the agent `.md` by name) keeps
  * resume faithful even if the agent definition is later edited, moved, or
  * deleted.
  */

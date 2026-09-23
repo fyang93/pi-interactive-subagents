@@ -15,16 +15,17 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import {
-  isMuxAvailable,
-  muxSetupHint,
+  isZellijAvailable,
+  zellijSetupHint,
   createSurface,
   sendCommand,
   sendLongCommand,
   pollForExit,
   closeSurface,
   shellEscape,
+  withProcessId,
   readScreen,
-} from "./tmux.ts";
+} from "./zellij.ts";
 
 import {
   countSessionEntryLines,
@@ -63,6 +64,7 @@ import {
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+const launchDeps = { createSurface, sendLongCommand, watchSubagent };
 
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
@@ -152,8 +154,8 @@ interface ListedAgentDefinition extends AgentDefinition {
 
 /**
  * The full subagent lifecycle/spawning toolset registered by this extension.
- * An agent is granted these (and this extension is loaded into its child
- * process) only when its frontmatter declares a non-empty `subagent_agents`.
+ * Added to explicit tool allowlists when `subagent_agents` grants delegation.
+ * Spawn targets are independently restricted by PI_SUBAGENT_ALLOWED.
  */
 const SPAWNING_TOOLS = [
   "subagent",
@@ -161,87 +163,20 @@ const SPAWNING_TOOLS = [
   "subagents_list",
 ] as const;
 
-/** Built-in tools pi provides natively — no extension needs to be loaded. */
-const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
-
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
-// ── Runtime tool-extension registration ─────────────────────────────────────
-// `getToolExtensionPath` otherwise only knows a closed set of tool names. Other
-// pi extensions that bundle a tool for subagents (e.g. a project-local
-// extension exposing a bespoke tool) register its name → extension-file path
-// here at load/session_start time so a child process can be launched with
-// `--no-extensions` + an explicit `-e <path>` for it. Mirrors the legacy
-// `subagents` extension's `registerToolExtension` hook.
-const EXTRA_TOOL_EXTENSIONS = new Map<string, string>();
-
-/** Register (or re-register) a custom tool's backing extension file. */
-export function registerToolExtension(name: string, extensionPath: string): void {
-  if (BUILTIN_TOOLS.has(name)) {
-    throw new Error(`Cannot register custom tool "${name}": shadows a built-in pi tool`);
-  }
-  if ((SPAWNING_TOOLS as readonly string[]).includes(name)) {
-    throw new Error(`Cannot register custom tool "${name}": shadows a spawning tool`);
-  }
-  const existing = EXTRA_TOOL_EXTENSIONS.get(name);
-  if (existing === extensionPath) return; // idempotent / reload-safe
-  if (existing !== undefined) {
-    throw new Error(
-      `Tool extension already registered for "${name}": ${existing} (refusing to overwrite with ${extensionPath})`,
-    );
-  }
-  EXTRA_TOOL_EXTENSIONS.set(name, extensionPath);
-}
-
-// Expose registration on a process-global so project-local extensions loaded
-// via jiti (separate module instances) can reach this shared map. Set at module
-// load so it's available before any `session_start` listener runs.
-(globalThis as any).__pi_interactive_subagents = {
-  registerToolExtension,
-};
-
-/**
- * Map a custom (non-built-in) tool name to the pi-extension file that
- * registers it. Used to build the child's `--extension` whitelist after
- * `--no-extensions` disables global discovery. Returns undefined for built-in
- * tools and for unknown names (which simply won't be granted).
- */
-function getToolExtensionPath(tool: string): string | undefined {
-  if (BUILTIN_TOOLS.has(tool)) return undefined;
-  // The four spawning tools are registered by THIS extension.
-  if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
-    return fileURLToPath(import.meta.url);
-  }
-  const extBase = join(getAgentConfigDir(), "extensions");
-  const map: Record<string, string> = {
-    web_search: join(extBase, "web-search", "index.ts"),
-    web_fetch: join(extBase, "web-fetch", "index.ts"),
-    video_extract: join(extBase, "video-extract", "index.ts"),
-    youtube_search: join(extBase, "youtube-search", "index.ts"),
-    google_image_search: join(extBase, "google-image-search", "index.ts"),
-    safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
-  };
-  // Prefer the built-in path, but fall back to a runtime-registered extension
-  // when that path no longer exists on disk (e.g. a built-in tool extension
-  // was disabled/removed but a project-local extension re-registered it).
-  const builtin = map[tool];
-  if (builtin && existsSync(builtin)) return builtin;
-  return EXTRA_TOOL_EXTENSIONS.get(tool);
-}
-
 /**
  * When this process was spawned as a restricted subagent, the parent pins the
  * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
- * restriction (top-level session, or an unrestricted child).
+ * restriction (top-level session); an empty set denies delegation.
  */
 const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
   const raw = process.env.PI_SUBAGENT_ALLOWED;
-  if (!raw) return null;
-  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  return list.length > 0 ? new Set(list) : null;
+  if (raw === undefined) return process.env.PI_SUBAGENT_AGENT ? new Set<string>() : null;
+  return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
 })();
 
 function getBundledAgentsDir(): string {
@@ -249,7 +184,7 @@ function getBundledAgentsDir(): string {
 }
 
 function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  const match = frontmatter.match(new RegExp(`^${key}:[ \\t]*(.*)$`, "m"));
   return match ? match[1].trim() : undefined;
 }
 
@@ -503,15 +438,15 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
-function muxUnavailableResult() {
+function zellijUnavailableResult() {
   return {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text: `Subagents require Zellij. ${zellijSetupHint()}`,
       },
     ],
-    details: { error: "tmux not available" },
+    details: { error: "Zellij not available" },
   };
 }
 
@@ -609,6 +544,7 @@ interface RunningSubagent {
   sessionFile: string;
   launchScriptFile?: string;
   activityFile?: string;
+  pidFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
     ok: boolean;
@@ -630,6 +566,9 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+// Only protects concurrent resume launches; runningSubagents handles the run itself.
+const RESUMING_SESSIONS_KEY = Symbol.for("pi-subagents/resuming-sessions");
+const resumingSessions = ((globalThis as any)[RESUMING_SESSIONS_KEY] ??= new Set<string>()) as Set<string>;
 
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
@@ -806,9 +745,8 @@ function buildSubagentToolAllowlist(
 
   const grantSpawning = opts?.grantSpawning ?? false;
 
-  // No explicit tool restriction and no spawning grant → don't pass --tools at
-  // all (the child keeps its default toolset).
-  if (requested.length === 0 && !grantSpawning) return null;
+  // No explicit tool restriction → keep the default toolset, even with delegation.
+  if (requested.length === 0) return null;
 
   const allow = new Set(requested);
   if (grantSpawning) {
@@ -822,11 +760,10 @@ function buildSubagentToolAllowlist(
 }
 
 /**
- * Apply a loadout snapshot's sandbox to a pi command's `parts` array: model,
- * identity (system prompt), and the default-deny tool/extension restriction
- * (`--no-extensions` + `--tools` + one `-e` per tool-backing extension).
+ * Apply a loadout snapshot to a pi command: model, identity, and optional
+ * tool allowlist. Extensions are discovered normally, independent of tools.
  *
- * This is the single source of truth for reconstructing a subagent's sandbox,
+ * This is the single source of truth for reconstructing a subagent's loadout,
  * used both by the initial `launchSubagent` and by the `subagent_message`
  * resume path so the two can never drift. Env vars (PI_SUBAGENT_AGENT /
  * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
@@ -857,21 +794,16 @@ function applySandboxToParts(
     parts.push(flag, shellEscape(spPath));
   }
 
-  // Default-deny: disable global extension discovery and re-enable only the
-  // extensions backing the whitelisted tools. A null allowlist means the spawn
-  // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
   if (loadout.toolAllowlist) {
-    parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
+  }
 
-    const extPaths = new Set<string>();
-    for (const tool of loadout.toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool);
-      if (extPath && existsSync(extPath)) extPaths.add(extPath);
-    }
-    for (const extPath of extPaths) {
-      parts.push("-e", shellEscape(extPath));
-    }
+  // Package-local helpers are not separately installed extensions.
+  if (!loadout.toolAllowlist || loadout.toolAllowlist.split(",").includes("safe_bash")) {
+    parts.push("-e", shellEscape(join(SUBAGENTS_DIR, "tools", "safe-bash.ts")));
+  }
+  if (loadout.spawnable?.length) {
+    parts.push("-e", shellEscape(fileURLToPath(import.meta.url)));
   }
 }
 
@@ -943,10 +875,11 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
  * `runningSubagents`. Parallel `subagent` tool calls run their synchronous
  * prefix (name defaulting) before any of them finishes `launchSubagent` and
  * registers, so without this they'd all see an empty map and pick the same
- * name. Reserved synchronously when a default name is chosen and released once
+ * name. Reserved synchronously when a launch name is chosen and released once
  * the subagent registers (or its launch fails).
  */
-const reservedNames = new Set<string>();
+const RESERVED_NAMES_KEY = Symbol.for("pi-subagents/reserved-names");
+const reservedNames = ((globalThis as any)[RESERVED_NAMES_KEY] ??= new Set<string>()) as Set<string>;
 
 /**
  * Return `base`, or `base-2`, `base-3`, … so the result is unique within this
@@ -1008,7 +941,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}" via terminal multiplexer: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1133,14 +1066,16 @@ export const __test__ = {
   buildPiPromptArgs,
   formatWidgetRightLabel,
   observeRunningSubagent,
-  getToolExtensionPath,
   resolveRunningByName,
   uniqueRunningName,
   reservedNames,
+  resumingSessions,
+  launchDeps,
   steerSubagent,
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  watchSubagent,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1171,6 +1106,7 @@ async function launchSubagent(
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
+  const lifecycleSignal = getModuleAbortSignal();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
@@ -1204,10 +1140,11 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
+  const surface = options?.surface ?? await launchDeps.createSurface(params.name);
   if (!surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
+  lifecycleSignal.throwIfAborted();
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1221,6 +1158,7 @@ async function launchSubagent(
   }
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
+  const pidFile = `${activityFile}.pid`;
   mkdirSync(dirname(activityFile), { recursive: true });
   const { inheritsConversationContext } = launchBehavior;
 
@@ -1271,7 +1209,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = `${cdPrefix}${withProcessId(cmdParts.join(" "), pidFile)}; echo '__SUBAGENT_DONE_'$?'__'`;
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1281,14 +1219,18 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
+    try {
+      launchDeps.sendLongCommand(surface, command, {
+        scriptPath: launchScriptFile,
+        scriptPreamble: [
+          `# Claude Code subagent launch script for ${JSON.stringify(params.name)}`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Surface: ${surface}`,
+        ].join("\n"),
+      });
+    } catch (error: any) {
+      throw new Error(`Failed to launch subagent on pane ${surface}; check that pane, then retry: ${error?.message ?? String(error)}`);
+    }
 
     const running: RunningSubagent = {
       id,
@@ -1300,6 +1242,7 @@ async function launchSubagent(
       sessionFile: subagentSessionFile,
       launchScriptFile,
       cli: "claude",
+      pidFile,
       sentinelFile,
       interactive: effectiveInteractive,
       statusState: createStatusState({
@@ -1329,15 +1272,10 @@ async function launchSubagent(
       ? localAgentDir
       : process.env.PI_CODING_AGENT_DIR ?? null;
 
-  // Default-deny model: when an agent restricts its tools (or is granted the
-  // spawning toolset), we disable global extension discovery and re-enable only
-  // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
-  // restriction keep their full default toolset and all global extensions.
+  // Tools restrict callable capabilities, not extension discovery.
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
 
-  // Snapshot the fully-resolved sandbox beside the session file so a later
-  // `subagent_message({ name })` resume can replay the exact same
-  // restriction instead of relaunching pi with all global extensions + tools.
+  // Snapshot the loadout so resume preserves the optional tool restriction.
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
@@ -1352,7 +1290,7 @@ async function launchSubagent(
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
-  // Apply model, identity, and the default-deny tool/extension restriction via
+  // Apply model, identity, and the optional tool restriction via
   // the shared helper (same code path resume uses — they can't drift).
   applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
 
@@ -1363,9 +1301,7 @@ async function launchSubagent(
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
   }
 
-  if (grantSpawning && agentDefs?.subagentAgents) {
-    envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
-  }
+  envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs?.subagentAgents?.join(",") ?? "")}`);
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
@@ -1413,7 +1349,7 @@ async function launchSubagent(
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
+  const piCommand = cdPrefix + envPrefix + withProcessId(parts.join(" "), pidFile);
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
@@ -1422,15 +1358,19 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
+  try {
+    launchDeps.sendLongCommand(surface, command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Subagent launch script for ${JSON.stringify(params.name)}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${JSON.stringify(subagentSessionFile)}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    });
+  } catch (error: any) {
+    throw new Error(`Failed to launch subagent on pane ${surface}; check that pane, then retry: ${error?.message ?? String(error)}`);
+  }
 
   const running: RunningSubagent = {
     id,
@@ -1442,6 +1382,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    pidFile,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1524,21 +1465,31 @@ function deliverPendingQuestion(running: RunningSubagent): void {
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  deps: { poll?: typeof pollForExit; close?: typeof closeSurface; observe?: typeof observeRunningSubagent } = {},
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
-      interval: 1000,
+    const result = await (deps.poll ?? pollForExit)(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+      // Sidecar exits are checked immediately; screen polling is only the fallback.
+      interval: 2000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      pidFile: running.pidFile,
       onTick() {
-        observeRunningSubagent(running);
+        (deps.observe ?? observeRunningSubagent)(running);
         deliverPendingQuestion(running);
       },
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
+
+    if (result.reason === "interrupted") {
+      runningSubagents.delete(running.id);
+      // The pane may now be an ordinary shell (or reused). Do not close it.
+      return { name, task, sessionFile, elapsed, exitCode: 1, error: "interrupted",
+        summary: `Subagent interrupted: ${result.errorMessage}` };
+    }
 
     if (running.cli === "claude") {
       // Claude Code result extraction
@@ -1570,7 +1521,11 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      try {
+        (deps.close ?? closeSurface)(surface);
+      } catch (error) {
+        console.warn(`Could not close completed subagent surface ${surface}: ${error}`);
+      }
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1598,7 +1553,11 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    try {
+      (deps.close ?? closeSurface)(surface);
+    } catch (error) {
+      console.warn(`Could not close completed subagent surface ${surface}: ${error}`);
+    }
     runningSubagents.delete(running.id);
 
     return {
@@ -1614,7 +1573,7 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      closeSurface(surface);
+      (deps.close ?? closeSurface)(surface);
     } catch {}
     runningSubagents.delete(running.id);
 
@@ -1676,9 +1635,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // The spawning tools are always registered here. Whether a child process can
-  // actually see/use them is governed by the parent's `--tools` allowlist and
-  // by which extensions are loaded into the child (default-deny --no-extensions
-  // + explicit -e). See launchSubagent().
+  // actually see/use them is governed by the optional `--tools` allowlist;
+  // PI_SUBAGENT_ALLOWED independently restricts delegation targets.
 
   // ── subagent tool ──
   pi.registerTool({
@@ -1758,10 +1716,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Validate prerequisites (need mux + a session file to derive the
+        // Validate prerequisites (need Zellij + a session file to derive the
         // artifact dir that hosts this session's name registry).
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
+        if (!isZellijAvailable()) {
+          return zellijUnavailableResult();
         }
 
         if (!ctx.sessionManager.getSessionFile()) {
@@ -1792,9 +1750,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (!params.name?.trim()) {
           const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
           params.name = uniqueRunningName(params.agent, registryNames);
-          reservedName = params.name;
-          reservedNames.add(reservedName);
         }
+        if (reservedNames.has(params.name) || [...runningSubagents.values()].some((r) => r.name === params.name)) {
+          const err = `A subagent named "${params.name}" is already running or launching.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        reservedName = params.name;
+        reservedNames.add(reservedName);
 
         // Launch the subagent (creates pane, sends command). Release the name
         // reservation once it registers in runningSubagents (or launch fails) —
@@ -1824,7 +1786,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
 
         // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
+        launchDeps.watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
@@ -2078,8 +2040,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
+        if (!isZellijAvailable()) {
+          return zellijUnavailableResult();
         }
 
         // ── Steer a running subagent ──
@@ -2129,9 +2091,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
-        // Reconstruct the sandbox from the snapshot written at spawn time.
-        // Without it we cannot safely resume: relaunching bare would load every
-        // global extension + the full toolset. Refuse rather than escalate.
+        // Restore the saved tool restrictions; refuse rather than lose them.
         const loadout = readSubagentLoadout(sessionPath);
         if (!loadout) {
           const err =
@@ -2149,9 +2109,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        const sessionKey = resolve(sessionPath);
+        if (resumingSessions.has(sessionKey) || [...runningSubagents.values()].some((r) => resolve(r.sessionFile) === sessionKey)) {
+          const err = `Subagent "${requestedName}" is already running or being resumed.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        resumingSessions.add(sessionKey);
+        const lifecycleSignal = getModuleAbortSignal();
+        let surface: string;
+        try {
+          surface = await launchDeps.createSurface(name);
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+          lifecycleSignal.throwIfAborted();
+        } finally {
+          resumingSessions.delete(sessionKey);
+        }
 
+        // The lock only covers async preparation; command creation, sending, and registration are synchronous.
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
 
@@ -2162,9 +2136,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
+        const pidFile = `${activityFile}.pid`;
         mkdirSync(dirname(activityFile), { recursive: true });
 
-        // Replay the model, identity, and default-deny tool/extension sandbox.
+        // Replay the model, identity, and optional tool allowlist.
         applySandboxToParts(parts, loadout, { artifactDir, name });
 
         let resumeMsgFile: string | undefined;
@@ -2193,9 +2168,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (resumeAgentDir) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
         }
-        if (loadout.spawnable && loadout.spawnable.length > 0) {
-          resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
-        }
+        resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable?.join(",") ?? "")}`);
         if (loadout.agent) {
           resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
         }
@@ -2212,7 +2185,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${resumeCdPrefix}${resumeEnvPrefix}${withProcessId(parts.join(" "), pidFile)}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2223,16 +2196,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
+        try {
+          launchDeps.sendLongCommand(surface, command, {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${JSON.stringify(name)}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${JSON.stringify(sessionPath)}`,
+              `# Surface: ${surface}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${JSON.stringify(resumeMsgFile)}`] : []),
+            ].join("\n"),
+          });
+        } catch (error: any) {
+          throw new Error(`Failed to resume subagent on pane ${surface}; check that pane, then retry: ${error?.message ?? String(error)}`);
+        }
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2244,6 +2221,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
+          pidFile,
           interactive,
           statusState: createStatusState({
             source: "pi",
@@ -2258,7 +2236,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        launchDeps.watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
 
